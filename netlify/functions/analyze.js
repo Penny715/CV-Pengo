@@ -21,15 +21,15 @@
  * racing for the same slots.
  */
 
-import { getStore } from "@netlify/blobs";
+import { connectLambda, getStore } from "@netlify/blobs";
 
 const MODEL = "gemini-2.5-flash";
 
 // Stay safely under Gemini's free-tier ~10-15 RPM cap, shared across all
-// visitors. Each CV analysis makes 3 calls, so 8/minute supports roughly
-// 2-3 analyses starting in the same 60-second window before others queue.
+// visitors. Each CV analysis makes 3 calls, so 10/minute supports roughly
+// 3 analyses starting in the same 60-second window before others queue.
 const WINDOW_MS = 60_000;
-const MAX_CALLS_PER_WINDOW = 8;
+const MAX_CALLS_PER_WINDOW = 10;
 const RATE_LIMIT_KEY = "gemini-call-log";
 
 /**
@@ -80,6 +80,16 @@ async function reserveSlot() {
 }
 
 export const handler = async (event) => {
+  // Legacy-format Netlify Functions don't get Blobs credentials injected
+  // automatically — connectLambda() wires them up from the request context.
+  // Wrapped so that if it ever fails, the rate limiter simply fails open
+  // (see reserveSlot) and the analysis itself is unaffected.
+  try {
+    connectLambda(event);
+  } catch {
+    /* Blobs unavailable — limiter will no-op for this request */
+  }
+
   if (event.httpMethod !== "POST") {
     return { statusCode: 405, body: JSON.stringify({ error: "Method not allowed" }) };
   }
