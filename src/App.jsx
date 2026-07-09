@@ -298,7 +298,7 @@ export default function App() {
     return out.replace(/[ \t]+/g, " ").trim();
   };
 
-  const callAI = async (payload, attempt = 0) => {
+  const callAI = async (payload, errAttempts = 0, queueAttempts = 0) => {
     let response;
     try {
       response = await fetch("/.netlify/functions/analyze", {
@@ -307,41 +307,37 @@ export default function App() {
         body: JSON.stringify(payload),
       });
     } catch {
-      if (attempt < 3) { await wait(1000 * (attempt + 1)); return callAI(payload, attempt + 1); }
+      if (errAttempts < 3) { await wait(1000 * (errAttempts + 1)); return callAI(payload, errAttempts + 1, queueAttempts); }
       throw new Error("Couldn't reach the analysis service. Check your connection and try again.");
     }
 
     if (!response.ok) {
       const s = response.status;
-      const transient = s === 429 || s === 408 || s >= 500;
 
-      // On 429, the server's shared queue tells us exactly how long until a
-      // slot frees up (Retry-After, in seconds) — use that instead of a
-      // guessed backoff, and allow a few extra attempts since this is a
-      // known, bounded wait rather than an unknown failure.
-      const isQueued = s === 429;
-      const maxAttempts = isQueued ? 6 : 3;
-
-      if (transient && attempt < maxAttempts) {
-        let delayMs;
-        if (isQueued) {
-          const retryAfterHeader = response.headers.get("Retry-After");
-          const retryAfterSec = Number(retryAfterHeader);
-          delayMs = Number.isFinite(retryAfterSec) && retryAfterSec > 0
+      // 429 = the shared queue is full; the server's Retry-After header says
+      // exactly when a slot frees up. Queue waits are tracked SEPARATELY from
+      // genuine error retries, so time spent waiting in a busy queue never
+      // burns the retry budget reserved for real failures.
+      if (s === 429) {
+        if (queueAttempts < 6) {
+          const retryAfterSec = Number(response.headers.get("Retry-After"));
+          const delayMs = Number.isFinite(retryAfterSec) && retryAfterSec > 0
             ? Math.min(retryAfterSec * 1000, 15000) // cap a single wait at 15s
-            : 2000 * (attempt + 1);
+            : 2000 * (queueAttempts + 1);
           setQueueNote(true);
-        } else {
-          delayMs = 1500 * (attempt + 1);
+          await wait(delayMs);
+          return callAI(payload, errAttempts, queueAttempts + 1);
         }
-        await wait(delayMs);
-        return callAI(payload, attempt + 1);
+        throw new Error("It's busy right now and the queue didn't clear in time. Please try again in a minute.");
       }
 
+      const transient = s === 408 || s >= 500;
+      if (transient && errAttempts < 3) {
+        await wait(1500 * (errAttempts + 1));
+        return callAI(payload, errAttempts + 1, queueAttempts);
+      }
       throw new Error(
-        isQueued
-          ? "It's busy right now and the queue didn't clear in time. Please try again in a minute."
-          : transient
+        transient
           ? "The analysis service is busy right now. Wait a moment and try again."
           : `The analysis service rejected the request (code ${s}). Try a smaller or re-exported PDF.`
       );
@@ -353,7 +349,7 @@ export default function App() {
     try {
       raw = await response.text();
     } catch {
-      if (attempt < 3) { await wait(1000 * (attempt + 1)); return callAI(payload, attempt + 1); }
+      if (errAttempts < 3) { await wait(1000 * (errAttempts + 1)); return callAI(payload, errAttempts + 1, queueAttempts); }
       throw new Error("The analysis response was interrupted. Run the analysis again.");
     }
 
@@ -361,14 +357,14 @@ export default function App() {
     try {
       text = JSON.parse(raw).text || "";
     } catch {
-      if (attempt < 3) { await wait(1000 * (attempt + 1)); return callAI(payload, attempt + 1); }
+      if (errAttempts < 3) { await wait(1000 * (errAttempts + 1)); return callAI(payload, errAttempts + 1, queueAttempts); }
       throw new Error("The analysis service returned an invalid response. Run the analysis again.");
     }
 
     try {
       return parseLoose(text);
     } catch {
-      if (attempt < 3) { await wait(800); return callAI(payload, attempt + 1); }
+      if (errAttempts < 3) { await wait(800); return callAI(payload, errAttempts + 1, queueAttempts); }
       throw new Error("The analysis came back in an unexpected format. Run the analysis again.");
     }
   };
@@ -448,15 +444,24 @@ export default function App() {
       }, 450);
     } catch (err) {
       timersRef.current.forEach(clearInterval);
+      // Always log the full error so it's visible in the browser console
+      // (F12 -> Console) — essential for diagnosing failures in the field.
+      console.error("[CV Pengo] analysis failed:", err);
       const known = [
         "Couldn't reach", "The analysis service", "The analysis response",
         "The analysis came back", "The analysis was incomplete",
         "We couldn't read", "That PDF", "Upload your CV",
+        "It's busy right now",
       ];
       const msg = err && typeof err.message === "string" ? err.message : "";
+      // For unknown errors, keep the friendly headline but append a short
+      // technical detail — this turns "something went wrong" reports into
+      // actionable diagnoses without exposing anything sensitive.
       const friendly = known.some((k) => msg.startsWith(k))
         ? msg
-        : "Something went wrong while analyzing your CV. Please try again.";
+        : `Something went wrong while analyzing your CV. Please try again.${
+            msg ? ` (detail: ${msg.slice(0, 140)})` : ""
+          }`;
       setError(friendly);
       setView("upload");
     }
