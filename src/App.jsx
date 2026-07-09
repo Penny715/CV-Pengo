@@ -162,6 +162,7 @@ export default function App() {
   const [result, setResult] = useState(null);
   const [dragging, setDragging] = useState(false);
   const [stageIdx, setStageIdx] = useState(0);
+  const [queueNote, setQueueNote] = useState(false);
   const [copiedIdx, setCopiedIdx] = useState(null);
   const [progress, setProgress] = useState(0);
   const inputRef = useRef(null);
@@ -313,13 +314,40 @@ export default function App() {
     if (!response.ok) {
       const s = response.status;
       const transient = s === 429 || s === 408 || s >= 500;
-      if (transient && attempt < 3) { await wait(1500 * (attempt + 1)); return callAI(payload, attempt + 1); }
+
+      // On 429, the server's shared queue tells us exactly how long until a
+      // slot frees up (Retry-After, in seconds) — use that instead of a
+      // guessed backoff, and allow a few extra attempts since this is a
+      // known, bounded wait rather than an unknown failure.
+      const isQueued = s === 429;
+      const maxAttempts = isQueued ? 6 : 3;
+
+      if (transient && attempt < maxAttempts) {
+        let delayMs;
+        if (isQueued) {
+          const retryAfterHeader = response.headers.get("Retry-After");
+          const retryAfterSec = Number(retryAfterHeader);
+          delayMs = Number.isFinite(retryAfterSec) && retryAfterSec > 0
+            ? Math.min(retryAfterSec * 1000, 15000) // cap a single wait at 15s
+            : 2000 * (attempt + 1);
+          setQueueNote(true);
+        } else {
+          delayMs = 1500 * (attempt + 1);
+        }
+        await wait(delayMs);
+        return callAI(payload, attempt + 1);
+      }
+
       throw new Error(
-        transient
+        isQueued
+          ? "It's busy right now and the queue didn't clear in time. Please try again in a minute."
+          : transient
           ? "The analysis service is busy right now. Wait a moment and try again."
           : `The analysis service rejected the request (code ${s}). Try a smaller or re-exported PDF.`
       );
     }
+
+    setQueueNote(false);
 
     let raw;
     try {
@@ -352,6 +380,8 @@ export default function App() {
       return;
     }
     setView("loading");
+    const startedAt = Date.now();
+    setQueueNote(false);
     try {
       /* Prefer sending extracted text: tiny payload, universally accepted.
          Fall back to attaching the PDF itself only if extraction fails
@@ -409,7 +439,7 @@ export default function App() {
         throw new Error("The analysis was incomplete. Run the analysis again.");
       }
 
-      logUsage(parsed, hasJd);
+      logUsage(parsed, hasJd, Date.now() - startedAt);
 
       setProgress(100);
       setTimeout(() => {
@@ -457,8 +487,9 @@ export default function App() {
   };
 
   /* ---- usage logging (anonymous: scores + timestamp only) ---- */
-  const logUsage = (parsed, hadJd) => {
+  const logUsage = (parsed, hadJd, elapsedMs) => {
     try {
+      const isMobile = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
       fetch("/.netlify/functions/log-usage", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -467,6 +498,8 @@ export default function App() {
           atsScore: parsed.atsScore,
           jobMatchScore: typeof parsed.jobMatchScore === "number" ? parsed.jobMatchScore : "",
           hasJd: hadJd,
+          device: isMobile ? "Mobile" : "Desktop",
+          durationSec: typeof elapsedMs === "number" ? Math.round(elapsedMs / 100) / 10 : "",
         }),
       }).catch(() => {});
     } catch { /* logging never blocks the app */ }
@@ -528,7 +561,12 @@ export default function App() {
     doc.setFont("helvetica", "normal"); doc.setFontSize(11); doc.setTextColor(200, 212, 255);
     doc.text("AI-Powered CV Analysis Report", M, 76);
     doc.setFontSize(9); doc.setTextColor(170, 185, 235);
-    doc.text(`An initiative by The Young SEAkers (TYS)  ·  Generated ${new Date().toLocaleDateString()}`, M, 96);
+    doc.text(`A TYS Initiative  ·  Generated ${new Date().toLocaleDateString()}`, M, 96);
+    // TYS logo, top-right of the header band
+    try {
+      const logoW = 70, logoH = logoW * (382 / 679);
+      doc.addImage(TYS_LOGO, "PNG", W - M - logoW, 59 - logoH / 2, logoW, logoH);
+    } catch { /* logo is optional — never block report generation */ }
     y = 118 + 34;
 
     // Scores row
@@ -600,15 +638,35 @@ export default function App() {
     for (let p = 1; p <= pages; p++) {
       doc.setPage(p);
       doc.setFont("helvetica", "normal"); doc.setFontSize(8); doc.setTextColor(...gray);
-      doc.text(`CV Pengo · An initiative by The Young SEAkers (TYS) · Page ${p} of ${pages}`, M, H - 24);
+      doc.text(`CV Pengo · A TYS Initiative · Page ${p} of ${pages}`, M, H - 24);
     }
 
-    doc.save("CV-Pengo-Report.pdf");
+    // iOS Safari often blocks or mishandles jsPDF's forced download — opening
+    // the PDF in a new tab there is the reliable path (user can share/save
+    // from the native PDF viewer). All other browsers get a direct download.
+    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+    if (isIOS) {
+      const blobUrl = doc.output("bloburl");
+      const w = window.open(blobUrl, "_blank");
+      if (!w) {
+        // popup blocked — fall back to a same-tab navigation
+        window.location.href = blobUrl;
+      }
+    } else {
+      doc.save("CV-Pengo-Report.pdf");
+    }
   };
 
   /* ---- shareable 1080x1080 score card (canvas -> PNG) ---- */
-  const downloadScoreCard = () => {
+  const downloadScoreCard = async () => {
     if (!result) return;
+    // Wait for Playfair Display / Inter to finish loading — otherwise the
+    // canvas can silently fall back to a system font, most noticeable on
+    // slower mobile connections where the font request is still in flight.
+    try {
+      if (document.fonts && document.fonts.ready) await document.fonts.ready;
+    } catch { /* non-fatal — proceed with whatever font is available */ }
+
     const r = result;
     const size = 1080;
     const canvas = document.createElement("canvas");
@@ -659,17 +717,50 @@ export default function App() {
     ctx.font = "600 40px Inter, Arial, sans-serif";
     ctx.fillText("/ 100", cx, cy + 82);
 
-    // caption
+    // caption — overall score headline, plus job match only if available
     ctx.fillStyle = "#E8EDF9";
     ctx.font = "600 52px Inter, Arial, sans-serif";
     ctx.fillText(`My CV scored ${r.overallScore}/100 on CV Pengo`, size / 2, 800);
-    ctx.fillStyle = "#8B97B8";
-    ctx.font = "400 36px Inter, Arial, sans-serif";
-    ctx.fillText(`ATS Score: ${r.atsScore}/100${typeof r.jobMatchScore === "number" ? `  ·  Job Match: ${r.jobMatchScore}%` : ""}`, size / 2, 856);
+    if (typeof r.jobMatchScore === "number") {
+      ctx.fillStyle = "#8B97B8";
+      ctx.font = "400 36px Inter, Arial, sans-serif";
+      ctx.fillText(`Job Match: ${r.jobMatchScore}%`, size / 2, 856);
+    }
+
+    // Export: iOS Safari doesn't reliably trigger anchor "download" for
+    // blobs, so open the image in a new tab there (user long-presses to
+    // save). All other browsers get a direct file download.
+    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
 
     const finish = () => {
+      if (isIOS) {
+        const dataUrl = canvas.toDataURL("image/png");
+        const w = window.open();
+        if (w) {
+          w.document.write(
+            `<title>CV Pengo score card</title>` +
+            `<body style="margin:0;background:#050914;display:flex;align-items:center;justify-content:center;min-height:100vh;">` +
+            `<img src="${dataUrl}" style="max-width:100%;height:auto;" />` +
+            `</body>`
+          );
+        } else {
+          // popup blocked — fall back to a normal link tap
+          const a = document.createElement("a");
+          a.href = dataUrl;
+          a.download = "cv-pengo-score.png";
+          a.click();
+        }
+        return;
+      }
       canvas.toBlob((blob) => {
-        if (!blob) return;
+        if (!blob) {
+          // very old browser fallback
+          const a = document.createElement("a");
+          a.href = canvas.toDataURL("image/png");
+          a.download = "cv-pengo-score.png";
+          a.click();
+          return;
+        }
         const a = document.createElement("a");
         a.href = URL.createObjectURL(blob);
         a.download = "cv-pengo-score.png";
@@ -678,22 +769,15 @@ export default function App() {
       }, "image/png");
     };
 
-    // TYS logo + attribution, then export
+    // TYS logo, then export
     const img = new Image();
+    img.crossOrigin = "anonymous";
     img.onload = () => {
-      const lw = 220, lh = lw * (img.height / img.width);
-      ctx.drawImage(img, size / 2 - lw / 2, 930 - lh / 2, lw, lh);
-      ctx.fillStyle = "#8B97B8";
-      ctx.font = "400 26px Inter, Arial, sans-serif";
-      ctx.fillText("An initiative by The Young SEAkers (TYS)", size / 2, 1020);
+      const lw = 200, lh = lw * (img.height / img.width);
+      ctx.drawImage(img, size / 2 - lw / 2, 950 - lh / 2, lw, lh);
       finish();
     };
-    img.onerror = () => {
-      ctx.fillStyle = "#8B97B8";
-      ctx.font = "400 28px Inter, Arial, sans-serif";
-      ctx.fillText("An initiative by The Young SEAkers (TYS)", size / 2, 960);
-      finish();
-    };
+    img.onerror = () => finish();
     img.src = TYS_LOGO;
   };
 
@@ -724,7 +808,7 @@ export default function App() {
   const CollabBadge = (
     <div className="flex items-center justify-center gap-3" style={{ marginTop: 34, paddingBottom: 40 }}>
       <span style={{ fontSize: 12, letterSpacing: "0.14em", textTransform: "uppercase", color: T.dim }}>
-        An initiative by The Young SEAkers (TYS)
+        A TYS Initiative
       </span>
       <img src={TYS_LOGO} alt="The Young SEAkers Malaysia" style={{ height: 44, width: "auto", filter: "drop-shadow(0 2px 8px rgba(0,0,0,0.4))" }} />
     </div>
@@ -749,6 +833,15 @@ export default function App() {
           <p key={stageIdx} style={{ color: T.dim, fontSize: 15, minHeight: 22, margin: "0 0 26px", animation: "cvfade 0.5s ease" }}>
             {STAGES[stageIdx]}
           </p>
+          {queueNote && (
+            <div
+              className="flex items-center justify-center gap-2"
+              style={{ marginBottom: 20, padding: "9px 14px", borderRadius: 10, background: "rgba(242,178,76,0.10)", border: "1px solid rgba(242,178,76,0.28)" }}
+            >
+              <RefreshCw size={13} color={T.amber} style={{ animation: "cvspin 1.6s linear infinite" }} />
+              <span style={{ fontSize: 12.5, color: "#E8CE9C" }}>High demand right now — you're in a short queue.</span>
+            </div>
+          )}
           <Bar pct={progress} color={`linear-gradient(90deg, ${T.accentFrom}, ${T.accentTo})`} />
           <p style={{ color: T.dim, fontSize: 12.5, marginTop: 12 }}>{Math.round(progress)}%</p>
         </Glass>
@@ -981,6 +1074,21 @@ export default function App() {
         textarea::placeholder { color: #5F6C8F; }
         button:focus-visible, [role="button"]:focus-visible, textarea:focus-visible { outline: 2px solid ${T.accentTo}; outline-offset: 2px; }
         @media (prefers-reduced-motion: reduce) { * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; } }
+
+        /* ---- Mobile Safari / Chrome fixes ---- */
+        html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+        * { -webkit-tap-highlight-color: transparent; }
+        button, [role="button"] {
+          touch-action: manipulation;      /* removes the 300ms tap delay + double-tap zoom */
+          -webkit-user-select: none; user-select: none;
+          -webkit-appearance: none; appearance: none;
+        }
+        input, textarea {
+          font-size: 16px;                 /* iOS Safari auto-zooms on focus if inputs are <16px */
+          -webkit-appearance: none; appearance: none;
+        }
+        textarea { -webkit-overflow-scrolling: touch; }
+        input[type="file"] { font-size: 16px; }
       `}</style>
 
       <div style={{ maxWidth: 640, margin: "0 auto", padding: "56px 20px 0", textAlign: "center" }}>
@@ -1065,7 +1173,7 @@ export default function App() {
             style={{
               width: "100%", boxSizing: "border-box", resize: "vertical",
               background: T.inset, border: `1px solid ${T.cardBorder}`, borderRadius: 14,
-              padding: "14px 16px", color: T.text, fontSize: 14.5, lineHeight: 1.6,
+              padding: "14px 16px", color: T.text, fontSize: 16, lineHeight: 1.6,
               fontFamily: sans, minHeight: 120,
             }}
           />
