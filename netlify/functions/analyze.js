@@ -39,33 +39,44 @@ const RATE_LIMIT_KEY = "gemini-call-log";
  * retry rather than guessing.
  */
 async function reserveSlot() {
-  const store = getStore("rate-limiter");
-  let timestamps = [];
+  // The entire function is wrapped in try/catch: if Netlify Blobs has any
+  // problem at all — misconfiguration, transient outage, whatever — the
+  // rate limiter must fail OPEN (allow the request) rather than crash the
+  // handler. A broken courtesy feature should never take down the actual
+  // CV analysis.
   try {
-    const raw = await store.get(RATE_LIMIT_KEY, { type: "json" });
-    if (Array.isArray(raw)) timestamps = raw;
+    const store = getStore("rate-limiter");
+
+    let timestamps = [];
+    try {
+      const raw = await store.get(RATE_LIMIT_KEY, { type: "json" });
+      if (Array.isArray(raw)) timestamps = raw;
+    } catch {
+      // No prior log yet, or a transient read error — proceed as if empty.
+    }
+
+    const now = Date.now();
+    timestamps = timestamps.filter((t) => now - t < WINDOW_MS);
+
+    if (timestamps.length >= MAX_CALLS_PER_WINDOW) {
+      const oldest = timestamps[0];
+      const retryAfterMs = Math.max(500, WINDOW_MS - (now - oldest) + 250);
+      return { allowed: false, retryAfterMs };
+    }
+
+    timestamps.push(now);
+    try {
+      await store.setJSON(RATE_LIMIT_KEY, timestamps);
+    } catch {
+      // Best-effort logging — never block the actual request over this.
+    }
+    return { allowed: true };
   } catch {
-    // No prior log yet, or a transient read error — proceed as if empty.
-    // Failing open here is intentional: the limiter is a courtesy to avoid
-    // wasted Gemini calls, not a hard security boundary.
+    // getStore() itself failed, or something else went wrong that wasn't
+    // already caught above. Skip rate limiting entirely for this request
+    // rather than blocking the user.
+    return { allowed: true };
   }
-
-  const now = Date.now();
-  timestamps = timestamps.filter((t) => now - t < WINDOW_MS);
-
-  if (timestamps.length >= MAX_CALLS_PER_WINDOW) {
-    const oldest = timestamps[0];
-    const retryAfterMs = Math.max(500, WINDOW_MS - (now - oldest) + 250);
-    return { allowed: false, retryAfterMs };
-  }
-
-  timestamps.push(now);
-  try {
-    await store.setJSON(RATE_LIMIT_KEY, timestamps);
-  } catch {
-    // Best-effort logging — never block the actual request over this.
-  }
-  return { allowed: true };
 }
 
 export const handler = async (event) => {
