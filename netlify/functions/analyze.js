@@ -8,9 +8,65 @@
  *
  * Set GEMINI_API_KEY in Netlify: Site settings -> Environment variables.
  * NEVER commit the key to this repo.
+ *
+ * ---- Shared rate limiter ----
+ * Gemini's free tier caps requests per minute PER PROJECT, not per user —
+ * every visitor's browser calls this same function, which shares one
+ * project-wide quota. A queue that only lived in one person's browser tab
+ * couldn't prevent two different visitors from colliding, since each tab
+ * is an isolated copy of the page with no idea what anyone else is doing.
+ * This function tracks recent call timestamps in Netlify Blobs (shared,
+ * server-side storage, free on all Netlify plans) so it can see calls from
+ * EVERY visitor and make new requests wait their turn instead of all
+ * racing for the same slots.
  */
 
+import { getStore } from "@netlify/blobs";
+
 const MODEL = "gemini-2.5-flash";
+
+// Stay safely under Gemini's free-tier ~10-15 RPM cap, shared across all
+// visitors. Each CV analysis makes 3 calls, so 8/minute supports roughly
+// 2-3 analyses starting in the same 60-second window before others queue.
+const WINDOW_MS = 60_000;
+const MAX_CALLS_PER_WINDOW = 8;
+const RATE_LIMIT_KEY = "gemini-call-log";
+
+/**
+ * Checks the shared call log. If under the limit, records this call and
+ * allows it through. If at the limit, returns how long (ms) until the
+ * oldest call in the window ages out, so the caller can be told when to
+ * retry rather than guessing.
+ */
+async function reserveSlot() {
+  const store = getStore("rate-limiter");
+  let timestamps = [];
+  try {
+    const raw = await store.get(RATE_LIMIT_KEY, { type: "json" });
+    if (Array.isArray(raw)) timestamps = raw;
+  } catch {
+    // No prior log yet, or a transient read error — proceed as if empty.
+    // Failing open here is intentional: the limiter is a courtesy to avoid
+    // wasted Gemini calls, not a hard security boundary.
+  }
+
+  const now = Date.now();
+  timestamps = timestamps.filter((t) => now - t < WINDOW_MS);
+
+  if (timestamps.length >= MAX_CALLS_PER_WINDOW) {
+    const oldest = timestamps[0];
+    const retryAfterMs = Math.max(500, WINDOW_MS - (now - oldest) + 250);
+    return { allowed: false, retryAfterMs };
+  }
+
+  timestamps.push(now);
+  try {
+    await store.setJSON(RATE_LIMIT_KEY, timestamps);
+  } catch {
+    // Best-effort logging — never block the actual request over this.
+  }
+  return { allowed: true };
+}
 
 export const handler = async (event) => {
   if (event.httpMethod !== "POST") {
@@ -18,6 +74,7 @@ export const handler = async (event) => {
   }
 
   const key = process.env.GEMINI_API_KEY;
+
   if (!key) {
     return {
       statusCode: 500,
@@ -35,6 +92,21 @@ export const handler = async (event) => {
   const { prompt, pdfBase64 } = payload;
   if (!prompt || typeof prompt !== "string") {
     return { statusCode: 400, body: JSON.stringify({ error: "Missing prompt" }) };
+  }
+
+  // Shared queue: check BEFORE spending a Gemini call, so a burst of
+  // visitors gets spaced out server-side instead of every request racing
+  // Gemini directly and getting rejected (which wastes quota on failures).
+  const slot = await reserveSlot();
+  if (!slot.allowed) {
+    return {
+      statusCode: 429,
+      headers: { "Retry-After": String(Math.ceil(slot.retryAfterMs / 1000)) },
+      body: JSON.stringify({
+        error: "High demand right now — you're in a short queue.",
+        retryAfterMs: slot.retryAfterMs,
+      }),
+    };
   }
 
   // Build Gemini "parts": text prompt, plus the PDF itself if the frontend
