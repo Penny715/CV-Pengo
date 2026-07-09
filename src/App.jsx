@@ -3,6 +3,7 @@ import {
   Upload, FileText, Sparkles, CheckCircle2, XCircle, AlertTriangle,
   Target, ListChecks, Wand2, ArrowRight, RefreshCw, Briefcase,
   GraduationCap, Wrench, FolderKanban, Award, User, Search, ChevronDown,
+  Download, Share2, Copy, Check, ShieldCheck,
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ */
@@ -161,6 +162,7 @@ export default function App() {
   const [result, setResult] = useState(null);
   const [dragging, setDragging] = useState(false);
   const [stageIdx, setStageIdx] = useState(0);
+  const [copiedIdx, setCopiedIdx] = useState(null);
   const [progress, setProgress] = useState(0);
   const inputRef = useRef(null);
   const timersRef = useRef([]);
@@ -407,6 +409,8 @@ export default function App() {
         throw new Error("The analysis was incomplete. Run the analysis again.");
       }
 
+      logUsage(parsed, hasJd);
+
       setProgress(100);
       setTimeout(() => {
         setResult(parsed);
@@ -428,6 +432,271 @@ export default function App() {
     }
   };
 
+  /* ---- copy improved bullet to clipboard ---- */
+  const copyBullet = async (text, idx) => {
+    let ok = false;
+    try {
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    } catch {
+      // fallback for older/mobile browsers
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed"; ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        ok = document.execCommand("copy");
+        document.body.removeChild(ta);
+      } catch { ok = false; }
+    }
+    if (ok) {
+      setCopiedIdx(idx);
+      setTimeout(() => setCopiedIdx((c) => (c === idx ? null : c)), 1800);
+    }
+  };
+
+  /* ---- usage logging (anonymous: scores + timestamp only) ---- */
+  const logUsage = (parsed, hadJd) => {
+    try {
+      fetch("/.netlify/functions/log-usage", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          overallScore: parsed.overallScore,
+          atsScore: parsed.atsScore,
+          jobMatchScore: typeof parsed.jobMatchScore === "number" ? parsed.jobMatchScore : "",
+          hasJd: hadJd,
+        }),
+      }).catch(() => {});
+    } catch { /* logging never blocks the app */ }
+  };
+
+  /* ---- downloadable PDF report ---- */
+  const downloadReport = async () => {
+    if (!result) return;
+    const r = result;
+    // Lazy-load jsPDF so it doesn't weigh down the initial page load
+    const { jsPDF } = await import("jspdf");
+    const doc = new jsPDF({ unit: "pt", format: "a4" });
+    const W = doc.internal.pageSize.getWidth();
+    const H = doc.internal.pageSize.getHeight();
+    const M = 48;
+    let y = 0;
+
+    const navy = [11, 27, 77];
+    const blue = [79, 107, 240];
+    const green = [22, 140, 92];
+    const red = [190, 55, 80];
+    const gray = [95, 105, 130];
+    const dark = [30, 36, 52];
+
+    const newPageIfNeeded = (needed = 60) => {
+      if (y + needed > H - M) { doc.addPage(); y = M; }
+    };
+    const heading = (txt) => {
+      newPageIfNeeded(70);
+      y += 26;
+      doc.setFont("helvetica", "bold"); doc.setFontSize(14); doc.setTextColor(...navy);
+      doc.text(txt, M, y);
+      y += 6;
+      doc.setDrawColor(...blue); doc.setLineWidth(1.2);
+      doc.line(M, y, M + 56, y);
+      y += 16;
+    };
+    const bullet = (txt, color = dark) => {
+      doc.setFont("helvetica", "normal"); doc.setFontSize(10.5); doc.setTextColor(...color);
+      const lines = doc.splitTextToSize(txt, W - M * 2 - 16);
+      newPageIfNeeded(lines.length * 14 + 8);
+      doc.circle(M + 4, y - 3, 1.6, "F");
+      doc.text(lines, M + 14, y);
+      y += lines.length * 14 + 4;
+    };
+    const para = (txt, color = dark, size = 10.5) => {
+      doc.setFont("helvetica", "normal"); doc.setFontSize(size); doc.setTextColor(...color);
+      const lines = doc.splitTextToSize(txt, W - M * 2);
+      newPageIfNeeded(lines.length * 14 + 8);
+      doc.text(lines, M, y);
+      y += lines.length * 14 + 6;
+    };
+
+    // Header band
+    doc.setFillColor(...navy);
+    doc.rect(0, 0, W, 118, "F");
+    doc.setFont("times", "bold"); doc.setFontSize(30); doc.setTextColor(255, 255, 255);
+    doc.text("CV Pengo", M, 56);
+    doc.setFont("helvetica", "normal"); doc.setFontSize(11); doc.setTextColor(200, 212, 255);
+    doc.text("AI-Powered CV Analysis Report", M, 76);
+    doc.setFontSize(9); doc.setTextColor(170, 185, 235);
+    doc.text(`An initiative by The Young SEAkers (TYS)  ·  Generated ${new Date().toLocaleDateString()}`, M, 96);
+    y = 118 + 34;
+
+    // Scores row
+    doc.setFont("helvetica", "bold"); doc.setFontSize(12); doc.setTextColor(...navy);
+    const scoreEntries = [["Overall Score", r.overallScore], ["ATS Score", r.atsScore]];
+    if (typeof r.jobMatchScore === "number") scoreEntries.push(["Job Match", r.jobMatchScore]);
+    let x = M;
+    scoreEntries.forEach(([label, val]) => {
+      doc.setFillColor(240, 244, 255);
+      doc.roundedRect(x, y - 18, 150, 54, 8, 8, "F");
+      doc.setFont("helvetica", "bold"); doc.setFontSize(20); doc.setTextColor(...blue);
+      doc.text(`${val}`, x + 16, y + 8);
+      doc.setFontSize(9); doc.setTextColor(...gray);
+      doc.text(`/100  ${label}`, x + 16, y + 24);
+      x += 166;
+    });
+    y += 60;
+
+    heading("Strengths");
+    (r.strengths || []).forEach((s) => bullet(s, green));
+
+    heading("Weaknesses");
+    (r.weaknesses || []).forEach((s) => bullet(s, red));
+
+    heading("ATS Optimization");
+    const kw = (r.ats?.missingKeywords || []).join(", ");
+    const sk = (r.ats?.missingSkills || []).join(", ");
+    if (kw) para(`Missing keywords: ${kw}`);
+    if (sk) para(`Missing skills: ${sk}`);
+    [...(r.ats?.formattingIssues || []), ...(r.ats?.compatibilityNotes || [])].forEach((s) => bullet(s));
+
+    heading("Section-by-Section Feedback");
+    (r.sections || []).forEach((s) => {
+      newPageIfNeeded(50);
+      doc.setFont("helvetica", "bold"); doc.setFontSize(11); doc.setTextColor(...navy);
+      doc.text(`${s.name}${s.present === false ? "  (not found)" : ""}`, M, y);
+      y += 14;
+      para(s.feedback || "");
+    });
+
+    heading("Bullet Point Upgrades");
+    (r.bulletImprovements || []).forEach((b, i) => {
+      newPageIfNeeded(80);
+      doc.setFont("helvetica", "bold"); doc.setFontSize(10); doc.setTextColor(...red);
+      doc.text(`Before ${i + 1}:`, M, y); y += 13;
+      para(b.before, gray, 10);
+      doc.setFont("helvetica", "bold"); doc.setFontSize(10); doc.setTextColor(...green);
+      doc.text(`After ${i + 1}:`, M, y); y += 13;
+      para(b.after, dark, 10);
+      y += 4;
+    });
+
+    if (r.jobMatch) {
+      heading("Job Match Analysis");
+      const ms = (r.jobMatch.matchingSkills || []).join(", ");
+      const mq = (r.jobMatch.missingQualifications || []).join(", ");
+      const ki = (r.jobMatch.keywordsToInclude || []).join(", ");
+      if (ms) para(`Matching skills: ${ms}`);
+      if (mq) para(`Missing qualifications: ${mq}`);
+      if (ki) para(`Keywords to include: ${ki}`);
+      (r.jobMatch.suggestions || []).forEach((s) => bullet(s));
+    }
+
+    heading("Action Plan — Top 5");
+    (r.actionPlan || []).slice(0, 5).forEach((a, i) => bullet(`${i + 1}. ${a}`));
+
+    // Footer on every page
+    const pages = doc.getNumberOfPages();
+    for (let p = 1; p <= pages; p++) {
+      doc.setPage(p);
+      doc.setFont("helvetica", "normal"); doc.setFontSize(8); doc.setTextColor(...gray);
+      doc.text(`CV Pengo · An initiative by The Young SEAkers (TYS) · Page ${p} of ${pages}`, M, H - 24);
+    }
+
+    doc.save("CV-Pengo-Report.pdf");
+  };
+
+  /* ---- shareable 1080x1080 score card (canvas -> PNG) ---- */
+  const downloadScoreCard = () => {
+    if (!result) return;
+    const r = result;
+    const size = 1080;
+    const canvas = document.createElement("canvas");
+    canvas.width = size; canvas.height = size;
+    const ctx = canvas.getContext("2d");
+
+    // background gradient
+    const g = ctx.createLinearGradient(0, 0, size, size);
+    g.addColorStop(0, "#050914");
+    g.addColorStop(0.5, "#0B1B4D");
+    g.addColorStop(1, "#0E2260");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, size, size);
+
+    // glow
+    const rg = ctx.createRadialGradient(size / 2, 300, 60, size / 2, 300, 520);
+    rg.addColorStop(0, "rgba(79,107,240,0.35)");
+    rg.addColorStop(1, "rgba(79,107,240,0)");
+    ctx.fillStyle = rg;
+    ctx.fillRect(0, 0, size, size);
+
+    // badge
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#9FB4FF";
+    ctx.font = "600 34px Inter, Arial, sans-serif";
+    ctx.fillText("AI-POWERED CV ANALYSIS", size / 2, 130);
+
+    // title
+    ctx.fillStyle = "#F0F3FF";
+    ctx.font = "800 96px 'Playfair Display', Georgia, serif";
+    ctx.fillText("CV Pengo", size / 2, 240);
+
+    // score ring
+    const cx = size / 2, cy = 520, rad = 170;
+    ctx.lineWidth = 26;
+    ctx.strokeStyle = "rgba(122,152,255,0.18)";
+    ctx.beginPath(); ctx.arc(cx, cy, rad, 0, Math.PI * 2); ctx.stroke();
+    const frac = Math.max(0, Math.min(1, r.overallScore / 100));
+    const ringColor = r.overallScore >= 80 ? "#3DDC97" : r.overallScore >= 60 ? "#F2B24C" : "#F0647A";
+    ctx.strokeStyle = ringColor;
+    ctx.lineCap = "round";
+    ctx.beginPath(); ctx.arc(cx, cy, rad, -Math.PI / 2, -Math.PI / 2 + frac * Math.PI * 2); ctx.stroke();
+
+    ctx.fillStyle = "#FFFFFF";
+    ctx.font = "800 130px Inter, Arial, sans-serif";
+    ctx.fillText(`${r.overallScore}`, cx, cy + 24);
+    ctx.fillStyle = "#8B97B8";
+    ctx.font = "600 40px Inter, Arial, sans-serif";
+    ctx.fillText("/ 100", cx, cy + 82);
+
+    // caption
+    ctx.fillStyle = "#E8EDF9";
+    ctx.font = "600 52px Inter, Arial, sans-serif";
+    ctx.fillText(`My CV scored ${r.overallScore}/100 on CV Pengo`, size / 2, 800);
+    ctx.fillStyle = "#8B97B8";
+    ctx.font = "400 36px Inter, Arial, sans-serif";
+    ctx.fillText(`ATS Score: ${r.atsScore}/100${typeof r.jobMatchScore === "number" ? `  ·  Job Match: ${r.jobMatchScore}%` : ""}`, size / 2, 856);
+
+    const finish = () => {
+      canvas.toBlob((blob) => {
+        if (!blob) return;
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "cv-pengo-score.png";
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+      }, "image/png");
+    };
+
+    // TYS logo + attribution, then export
+    const img = new Image();
+    img.onload = () => {
+      const lw = 220, lh = lw * (img.height / img.width);
+      ctx.drawImage(img, size / 2 - lw / 2, 930 - lh / 2, lw, lh);
+      ctx.fillStyle = "#8B97B8";
+      ctx.font = "400 26px Inter, Arial, sans-serif";
+      ctx.fillText("An initiative by The Young SEAkers (TYS)", size / 2, 1020);
+      finish();
+    };
+    img.onerror = () => {
+      ctx.fillStyle = "#8B97B8";
+      ctx.font = "400 28px Inter, Arial, sans-serif";
+      ctx.fillText("An initiative by The Young SEAkers (TYS)", size / 2, 960);
+      finish();
+    };
+    img.src = TYS_LOGO;
+  };
+
   const reset = () => {
     setView("upload");
     setResult(null);
@@ -440,9 +709,15 @@ export default function App() {
   /*  Shared chrome                                                      */
   /* ------------------------------------------------------------------ */
   const Background = (
-    <div style={{ position: "fixed", inset: 0, zIndex: -1, background: `linear-gradient(160deg, ${T.bgFrom} 0%, ${T.bgMid} 55%, ${T.bgTo} 100%)` }}>
-      <div style={{ position: "absolute", top: "-20%", left: "50%", transform: "translateX(-50%)", width: 900, height: 520, borderRadius: "50%", background: "radial-gradient(closest-side, rgba(79,107,240,0.22), transparent)", filter: "blur(40px)" }} />
-      <div style={{ position: "absolute", bottom: "-25%", right: "-10%", width: 700, height: 500, borderRadius: "50%", background: "radial-gradient(closest-side, rgba(91,155,245,0.10), transparent)", filter: "blur(50px)" }} />
+    <div style={{ position: "fixed", inset: 0, zIndex: -1, background: "linear-gradient(165deg, #030614 0%, #081233 38%, #0B1B4D 72%, #0E2260 100%)" }}>
+      {/* royal-blue aurora glows */}
+      <div style={{ position: "absolute", top: "-22%", left: "50%", transform: "translateX(-50%)", width: 980, height: 560, borderRadius: "50%", background: "radial-gradient(closest-side, rgba(64,98,255,0.28), transparent)", filter: "blur(46px)" }} />
+      <div style={{ position: "absolute", top: "30%", left: "-14%", width: 620, height: 620, borderRadius: "50%", background: "radial-gradient(closest-side, rgba(28,54,180,0.22), transparent)", filter: "blur(60px)" }} />
+      <div style={{ position: "absolute", bottom: "-28%", right: "-12%", width: 760, height: 560, borderRadius: "50%", background: "radial-gradient(closest-side, rgba(91,155,245,0.16), transparent)", filter: "blur(56px)" }} />
+      {/* faint dot grid for depth */}
+      <div style={{ position: "absolute", inset: 0, backgroundImage: "radial-gradient(rgba(140,165,255,0.07) 1px, transparent 1px)", backgroundSize: "34px 34px", maskImage: "linear-gradient(to bottom, rgba(0,0,0,0.9), rgba(0,0,0,0.25) 60%, transparent)", WebkitMaskImage: "linear-gradient(to bottom, rgba(0,0,0,0.9), rgba(0,0,0,0.25) 60%, transparent)" }} />
+      {/* vignette to keep card contrast */}
+      <div style={{ position: "absolute", inset: 0, background: "radial-gradient(ellipse at 50% 40%, transparent 55%, rgba(2,5,16,0.55) 100%)" }} />
     </div>
   );
 
@@ -504,13 +779,29 @@ export default function App() {
                 </p>
               )}
             </div>
-            <button
-              onClick={reset}
-              className="flex items-center gap-2"
-              style={{ padding: "10px 18px", borderRadius: 12, border: `1px solid ${T.cardBorder}`, background: "rgba(122,152,255,0.08)", color: T.text, fontSize: 14, cursor: "pointer" }}
-            >
-              <RefreshCw size={15} /> Analyze another CV
-            </button>
+            <div className="flex items-center gap-2 flex-wrap">
+              <button
+                onClick={downloadReport}
+                className="flex items-center gap-2"
+                style={{ padding: "10px 18px", borderRadius: 12, border: "none", background: `linear-gradient(90deg, ${T.accentFrom}, ${T.accentTo})`, color: "#fff", fontSize: 14, fontWeight: 600, cursor: "pointer", boxShadow: "0 8px 22px -8px rgba(79,107,240,0.6)" }}
+              >
+                <Download size={15} /> Download PDF report
+              </button>
+              <button
+                onClick={downloadScoreCard}
+                className="flex items-center gap-2"
+                style={{ padding: "10px 18px", borderRadius: 12, border: `1px solid ${T.cardBorder}`, background: "rgba(122,152,255,0.10)", color: T.text, fontSize: 14, cursor: "pointer" }}
+              >
+                <Share2 size={15} /> Share score card
+              </button>
+              <button
+                onClick={reset}
+                className="flex items-center gap-2"
+                style={{ padding: "10px 18px", borderRadius: 12, border: `1px solid ${T.cardBorder}`, background: "rgba(122,152,255,0.08)", color: T.text, fontSize: 14, cursor: "pointer" }}
+              >
+                <RefreshCw size={15} /> Analyze another CV
+              </button>
+            </div>
           </div>
 
           {/* scores */}
@@ -609,9 +900,17 @@ export default function App() {
                   <div className="flex justify-center" style={{ padding: "6px 0" }}>
                     <ChevronDown size={16} color={T.dim} />
                   </div>
-                  <div style={{ background: "rgba(61,220,151,0.07)", border: "1px solid rgba(61,220,151,0.22)", borderRadius: "4px 12px 12px 12px", padding: "12px 16px", fontSize: 14, lineHeight: 1.55, color: "#BFE8D6" }}>
+                  <div style={{ position: "relative", background: "rgba(61,220,151,0.07)", border: "1px solid rgba(61,220,151,0.22)", borderRadius: "4px 12px 12px 12px", padding: "12px 44px 12px 16px", fontSize: 14, lineHeight: 1.55, color: "#BFE8D6" }}>
                     <span style={{ fontSize: 11, letterSpacing: "0.1em", textTransform: "uppercase", color: T.green, fontWeight: 700, display: "block", marginBottom: 4 }}>After</span>
                     {b.after}
+                    <button
+                      onClick={() => copyBullet(b.after, i)}
+                      aria-label="Copy improved bullet"
+                      title={copiedIdx === i ? "Copied!" : "Copy to clipboard"}
+                      style={{ position: "absolute", top: 10, right: 10, width: 30, height: 30, borderRadius: 8, border: `1px solid ${copiedIdx === i ? "rgba(61,220,151,0.5)" : T.cardBorder}`, background: copiedIdx === i ? "rgba(61,220,151,0.15)" : "rgba(122,152,255,0.08)", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}
+                    >
+                      {copiedIdx === i ? <Check size={14} color={T.green} /> : <Copy size={14} color={T.dim} />}
+                    </button>
                   </div>
                 </div>
               ))}
@@ -786,6 +1085,13 @@ export default function App() {
           >
             <Sparkles size={17} /> Analyze CV
           </button>
+
+          <div className="flex items-center justify-center gap-2" style={{ marginTop: 14 }}>
+            <ShieldCheck size={14} color={T.dim} />
+            <span style={{ fontSize: 12.5, color: T.dim }}>
+              Your CV is analyzed in real time and never stored.
+            </span>
+          </div>
         </Glass>
 
         {CollabBadge}
