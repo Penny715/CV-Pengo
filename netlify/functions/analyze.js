@@ -177,7 +177,12 @@ export const handler = async (event) => {
             // Forces valid JSON output — pairs with the JSON-only prompts.
             responseMimeType: "application/json",
             temperature: 0.4,
-            maxOutputTokens: 2048,
+            maxOutputTokens: 3072,
+            // gemini-2.5-flash thinks by default, and thinking tokens are
+            // drawn from maxOutputTokens too. These prompts are plain
+            // extraction/formatting, not reasoning, so thinking only risks
+            // eating the budget and truncating the JSON before it completes.
+            thinkingConfig: { thinkingBudget: 0 },
           },
         }),
       }
