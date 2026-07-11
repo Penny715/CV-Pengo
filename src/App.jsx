@@ -6,6 +6,8 @@ import {
   Download, Share2, Copy, Check, ShieldCheck,
 } from "lucide-react";
 
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "https://cv-pengo.netlify.app";
+
 /* ------------------------------------------------------------------ */
 /*  Design tokens                                                      */
 /* ------------------------------------------------------------------ */
@@ -301,7 +303,7 @@ export default function App() {
   const callAI = async (payload, errAttempts = 0, queueAttempts = 0) => {
     let response;
     try {
-      response = await fetch("/.netlify/functions/analyze", {
+      response = await fetch(`${API_BASE_URL}/.netlify/functions/analyze`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
@@ -495,7 +497,7 @@ export default function App() {
   const logUsage = (parsed, hadJd, elapsedMs) => {
     try {
       const isMobile = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-      fetch("/.netlify/functions/log-usage", {
+      fetch(`${API_BASE_URL}/.netlify/functions/log-usage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

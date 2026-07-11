@@ -79,7 +79,21 @@ async function reserveSlot() {
   }
 }
 
+// Cross-origin: the frontend (e.g. local dev on localhost:5173, or any
+// other host) calls this function on the cv-pengo.netlify.app origin, so
+// the browser sends a CORS preflight OPTIONS request first. Without these
+// headers the preflight is rejected and the real POST never gets sent.
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
+
 export const handler = async (event) => {
+  if (event.httpMethod === "OPTIONS") {
+    return { statusCode: 204, headers: CORS_HEADERS, body: "" };
+  }
+
   // Legacy-format Netlify Functions don't get Blobs credentials injected
   // automatically — connectLambda() wires them up from the request context.
   // Wrapped so that if it ever fails, the rate limiter simply fails open
@@ -91,7 +105,11 @@ export const handler = async (event) => {
   }
 
   if (event.httpMethod !== "POST") {
-    return { statusCode: 405, body: JSON.stringify({ error: "Method not allowed" }) };
+    return {
+      statusCode: 405,
+      headers: CORS_HEADERS,
+      body: JSON.stringify({ error: "Method not allowed" }),
+    };
   }
 
   const key = process.env.GEMINI_API_KEY;
@@ -99,6 +117,7 @@ export const handler = async (event) => {
   if (!key) {
     return {
       statusCode: 500,
+      headers: CORS_HEADERS,
       body: JSON.stringify({ error: "GEMINI_API_KEY is not configured on the server." }),
     };
   }
@@ -107,12 +126,20 @@ export const handler = async (event) => {
   try {
     payload = JSON.parse(event.body || "{}");
   } catch {
-    return { statusCode: 400, body: JSON.stringify({ error: "Invalid request body" }) };
+    return {
+      statusCode: 400,
+      headers: CORS_HEADERS,
+      body: JSON.stringify({ error: "Invalid request body" }),
+    };
   }
 
   const { prompt, pdfBase64 } = payload;
   if (!prompt || typeof prompt !== "string") {
-    return { statusCode: 400, body: JSON.stringify({ error: "Missing prompt" }) };
+    return {
+      statusCode: 400,
+      headers: CORS_HEADERS,
+      body: JSON.stringify({ error: "Missing prompt" }),
+    };
   }
 
   // Shared queue: check BEFORE spending a Gemini call, so a burst of
@@ -122,7 +149,7 @@ export const handler = async (event) => {
   if (!slot.allowed) {
     return {
       statusCode: 429,
-      headers: { "Retry-After": String(Math.ceil(slot.retryAfterMs / 1000)) },
+      headers: { ...CORS_HEADERS, "Retry-After": String(Math.ceil(slot.retryAfterMs / 1000)) },
       body: JSON.stringify({
         error: "High demand right now — you're in a short queue.",
         retryAfterMs: slot.retryAfterMs,
@@ -163,6 +190,7 @@ export const handler = async (event) => {
       // (429 = rate limited, 5xx = transient).
       return {
         statusCode: r.status,
+        headers: CORS_HEADERS,
         body: JSON.stringify({ error: `Gemini error (${r.status})` }),
       };
     }
@@ -171,7 +199,11 @@ export const handler = async (event) => {
     try {
       data = JSON.parse(raw);
     } catch {
-      return { statusCode: 502, body: JSON.stringify({ error: "Invalid response from Gemini" }) };
+      return {
+        statusCode: 502,
+        headers: CORS_HEADERS,
+        body: JSON.stringify({ error: "Invalid response from Gemini" }),
+      };
     }
 
     const text = (data.candidates?.[0]?.content?.parts || [])
@@ -180,15 +212,23 @@ export const handler = async (event) => {
       .trim();
 
     if (!text) {
-      return { statusCode: 502, body: JSON.stringify({ error: "Empty response from Gemini" }) };
+      return {
+        statusCode: 502,
+        headers: CORS_HEADERS,
+        body: JSON.stringify({ error: "Empty response from Gemini" }),
+      };
     }
 
     return {
       statusCode: 200,
-      headers: { "Content-Type": "application/json" },
+      headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
       body: JSON.stringify({ text }),
     };
   } catch (e) {
-    return { statusCode: 500, body: JSON.stringify({ error: e.message || "Server error" }) };
+    return {
+      statusCode: 500,
+      headers: CORS_HEADERS,
+      body: JSON.stringify({ error: e.message || "Server error" }),
+    };
   }
 };
